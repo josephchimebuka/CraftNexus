@@ -115,6 +115,7 @@ const ESCROW: Symbol = symbol_short!("ESCROW");
 const PLATFORM_FEE: Symbol = symbol_short!("PLAT_FEE");
 const PLATFORM_WALLET: Symbol = symbol_short!("PLAT_WAL");
 const TOTAL_FEES: Symbol = symbol_short!("TOT_FEES");
+const ADMIN: Symbol = symbol_short!("ADMIN");
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
@@ -187,6 +188,7 @@ pub enum DataKey {
     MinEscrowAmount(Address),
     TotalFees(Address),
     FeeTokenIndex,
+    FeeTokenConfig(Address),
     ContractVersion,
     /// Platform configuration storage key
     PlatformConfig,
@@ -283,6 +285,14 @@ pub struct ArtisanStakeData {
 }
 
 #[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct StakeDeposit {
+    pub amount: i128,
+    pub cooldown_end: u64,
+}
+
+#[contracttype]
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 #[repr(u32)]
@@ -290,6 +300,23 @@ pub enum RecurringEscrowAction {
     Created = 0,
     CycleReleased = 1,
     Cancelled = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RecurringEscrow {
+    pub id: u64,
+    pub buyer: Address,
+    pub artisan: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub released_amount: i128,
+    pub frequency: u64,
+    pub duration: u32,
+    pub current_cycle: u64,
+    pub last_release_time: u64,
+    pub is_active: bool,
 }
 
 #[contracttype]
@@ -875,6 +902,8 @@ impl EscrowContract {
                 wasm_upgrade_cooldown: DEFAULT_WASM_UPGRADE_COOLDOWN,
                 max_dispute_duration: DEFAULT_MAX_DISPUTE_DURATION,
                 stake_cooldown: DEFAULT_STAKE_COOLDOWN,
+                expired_dispute_fee_policy: ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
+                min_release_window: DEFAULT_MIN_RELEASE_WINDOW,
             });
         }
 
@@ -900,7 +929,7 @@ impl EscrowContract {
         Ok(())
     }
 
-    fn emit_escrow_created(env: &Env, event: EscrowCreatedEvent) {
+    fn emit_escrow_created(env: &Env, event: EscrowEvent) {
         env.events()
             .publish((Symbol::new(env, "escrow"), event.escrow_id), event);
     }
@@ -1638,8 +1667,7 @@ impl EscrowContract {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
-        // Emit audit event for successful admin claim
-        Self::emit_admin_changed(&env, previous_admin, config.admin.clone(), "admin_claimed");
+        Ok(count)
     }
 
     /// Recover admin access using fallback admin after time lock period (#240)
@@ -1890,7 +1918,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &token, amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -1986,7 +2014,7 @@ impl EscrowContract {
         Self::update_active_obligations(&env, &buyer, 1);
         Self::update_active_obligations(&env, &seller, 1);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2021,7 +2049,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, escrow.amount);
         
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2638,7 +2666,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2727,7 +2755,7 @@ impl EscrowContract {
             &seller_amount,
         );
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -2796,7 +2824,7 @@ impl EscrowContract {
         escrow.release_window = new_window;
         env.storage().persistent().set(&escrow_key, &escrow);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3108,7 +3136,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id,
@@ -3322,7 +3350,7 @@ impl EscrowContract {
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3392,7 +3420,7 @@ impl EscrowContract {
             }
         }
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -3761,7 +3789,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(env, &params.token, params.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             env,
             EscrowEvent {
                 escrow_id: params.order_id as u64,
@@ -3906,7 +3934,7 @@ impl EscrowContract {
                         let escrow_opt: Option<Escrow> =
                             env.storage().persistent().get(&(ESCROW, id as u32));
                         if let Some(escrow) = escrow_opt {
-                            Self::emit_escrow_event(
+                            Self::emit_escrow_created(
                                 &env,
                                 EscrowEvent {
                                     escrow_id: id,
@@ -4081,7 +4109,7 @@ impl EscrowContract {
                     );
 
                     // Emit release event
-                    Self::emit_escrow_event(
+                    Self::emit_escrow_created(
                         &env,
                         EscrowEvent {
                             escrow_id: order_id as u64,
@@ -4324,7 +4352,7 @@ impl EscrowContract {
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -4384,7 +4412,7 @@ impl EscrowContract {
         Self::extend_persistent(&env, &stake_key);
 
         // Record stake operation in history queue for audit trail (#237)
-        if let Err(_) = Self::record_stake_history(&env, &artisan, new_stake, "stake_added") {
+        if let Err(_) = Self::record_stake_history(&env, &artisan, new_stake.amount, "stake_added") {
             env.panic_with_error(Error::StakeQueueFull);
         }
 
@@ -4448,8 +4476,10 @@ impl EscrowContract {
         }
 
         // Clear stake metadata before returning the reserved artisan funds.
-        env.storage().persistent().set(&stake_key, &0i128);
-        env.storage().persistent().remove(&stake_token_key);
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let cooldown_key = DataKey::StakeCooldownEnd(artisan.clone());
+        env.storage().persistent().remove(&stake_key);
+        env.storage().persistent().remove(&DataKey::ArtisanStakeQueue(artisan.clone()));
         env.storage().persistent().remove(&cooldown_key);
 
         // Return matured tokens to artisan
@@ -4769,7 +4799,7 @@ impl EscrowContract {
             Self::update_total_locked(&env, &escrow.token, -escrow.amount);
         }
 
-        Self::emit_escrow_event(
+        Self::emit_escrow_created(
             &env,
             EscrowEvent {
                 escrow_id: order_id as u64,
@@ -4958,7 +4988,7 @@ impl EscrowContract {
         if !escrow.is_active {
             env.panic_with_error(crate::Error::InvalidEscrowState);
         }
-        if escrow.current_cycle >= escrow.duration {
+        if escrow.current_cycle >= escrow.duration as u64 {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
@@ -4967,7 +4997,7 @@ impl EscrowContract {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
-        let cycle_amount = if escrow.current_cycle == escrow.duration - 1 {
+        let cycle_amount = if escrow.current_cycle == (escrow.duration as u64) - 1 {
             // Last cycle: handle remainder
             escrow.total_amount - escrow.released_amount
         } else {
@@ -4999,7 +5029,7 @@ impl EscrowContract {
         escrow.current_cycle += 1;
         escrow.last_release_time = now;
 
-        if escrow.current_cycle == escrow.duration {
+        if escrow.current_cycle == escrow.duration as u64 {
             escrow.is_active = false;
             // Decrement active recurring counts
             Self::update_active_obligations(&env, &escrow.buyer, -1);
