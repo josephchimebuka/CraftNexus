@@ -831,10 +831,8 @@ pub struct CraftNexusContract;
 
 /// Alias and compatibility layers
 pub type EscrowContract = CraftNexusContract;
-#[allow(non_upper_case_globals)]
-pub const EscrowContract: CraftNexusContract = CraftNexusContract;
+
 pub type EscrowContractClient<'a> = CraftNexusContractClient<'a>;
-pub type CreateEscrowParams = EscrowCreateParams;
 
 /// Guard to ensure reentry protection is cleared even if a panic or error occurs.
 /// This is essential to prevent contract locks from persisting across failed calls.

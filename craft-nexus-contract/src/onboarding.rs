@@ -1416,64 +1416,17 @@ impl OnboardingContract {
         }
     }
 
-    /// Promote an onboarded user to the `Moderator` role (Issue #116).
+    /// Assign or update the moderator role for a user (admin only).
     ///
-    /// Convenience wrapper around `update_user_role` that assigns
-    /// `UserRole::Moderator`. Only the platform admin may call this
-    /// function; the target user does not need to sign.
-    ///
-    /// # Integration notes — issue #517 / component #116
-    ///
-    /// ## Preconditions
-    /// - Contract must be initialized (`DataKey::Config` present).
-    /// - Caller must be the configured `platform_admin` (authenticated
-    ///   via `require_auth`).
-    /// - `user` must already be onboarded (`DataKey::UserProfile(user)`).
-    /// - `user` may hold any prior role (`Buyer`, `Artisan`, etc.); there
-    ///   is no self-service path to `Moderator` during `onboard_user`.
-    ///
-    /// ## Storage side-effects
-    /// - Reads and extends TTL on `DataKey::Config`.
-    /// - Reads, writes, and extends TTL on `DataKey::UserProfile(user)`,
-    ///   updating only the `role` field. Profile version
-    ///   (`CURRENT_USER_PROFILE_VERSION`) and all other fields are
-    ///   preserved unchanged.
-    ///
-    /// ## Emitted event — `RoleUpdated`
-    /// - **Topics:** `(Symbol::new("RoleUpdated"),)`
-    /// - **Data:** `(Address, UserRole, UserRole)` — `(user, old_role,
-    ///   UserRole::Moderator)`
-    /// - Indexers should treat this as the canonical signal that a user
-    ///   was promoted to moderator. The event carries both the previous
-    ///   and new role so a role-transition timeline can be reconstructed
-    ///   without a follow-up `get_user` call (Issue #520).
-    ///
-    /// ## Escrow integration
-    /// - Onboarding role assignment alone does **not** authorize dispute
-    ///   resolution on the escrow contract. Operators must also register
-    ///   the moderator's address via the escrow contract's
-    ///   `set_moderator`, which stores it in `PlatformConfig.moderator`.
-    ///   `resolve_dispute` accepts callers matching `config.admin`,
-    ///   `config.moderator`, or `config.arbitrator`.
-    /// - Moderators assigned here cannot invoke admin-only onboarding
-    ///   entrypoints (fee setters, `verify_user`, etc.).
-    ///
-    /// ## Off-chain consumers
-    /// - Use `has_role(user, UserRole::Moderator)` or `get_user_role`
-    ///   for read-only role checks (gas-only, safe for simulation).
-    /// - Prefer subscribing to `RoleUpdated` over polling profile reads.
-    ///
-    /// # Arguments
-    /// * `user` - Address of the onboarded user to promote
-    ///
-    /// # Returns
-    /// Updated `UserProfile` with `role == UserRole::Moderator`.
-    ///
-    /// # Reverts if
-    /// - Contract not initialized
-    /// - Caller is not platform admin
-    /// - User not found
+    /// # Security (#117)
+    /// Requires platform admin authorization before any state transition.
     pub fn set_moderator(env: Env, user: Address) -> UserProfile {
+        let config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        config.platform_admin.require_auth();
         Self::update_user_role(env, user, UserRole::Moderator)
     }
 
@@ -1601,6 +1554,50 @@ impl OnboardingContract {
             (Symbol::new(&env, "ProfileDeactivated"), user.clone()),
             (user, profile.role.clone()),
         );
+    }
+
+    /// Reactivate a previously deactivated profile (Issue #115).
+    ///
+    /// Re-registers the user's original username and sets status back to Active.
+    ///
+    /// # Reverts if
+    /// - Profile is not deactivated
+    /// - Username has been claimed by another user since deactivation
+    pub fn reactivate_profile(env: Env, user: Address) -> UserProfile {
+        user.require_auth();
+
+        let profile_key = DataKey::UserProfile(user.clone());
+        let mut profile: UserProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound));
+        Self::extend_persistent(&env, &profile_key);
+
+        if profile.status != ProfileStatus::Deactivated {
+            env.panic_with_error(Error::ProfileDeactivated);
+        }
+
+        // Re-claim username — fail if another user took it while deactivated
+        let normalized = normalize_username(&env, &profile.username);
+        if env.storage().persistent().has(&DataKey::Username(normalized.clone())) {
+            env.panic_with_error(Error::UsernameTaken);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(normalized.clone()), &user);
+        Self::extend_persistent(&env, &DataKey::Username(normalized));
+
+        profile.status = ProfileStatus::Active;
+        env.storage().persistent().set(&profile_key, &profile);
+        Self::extend_persistent(&env, &profile_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProfileReactivated"), user.clone()),
+            (user, profile.role.clone()),
+        );
+
+        profile
     }
 
     /// Verify user (admin only)
@@ -1935,7 +1932,7 @@ impl OnboardingContract {
                 .unwrap_or(Vec::new(env));
             history.push_back(VerificationEntry {
                 timestamp: env.ledger().timestamp(),
-                action: Symbol::new(env, "auto_verified"),
+                action: String::from_str(env, "auto_verified"),
                 by: None,
             });
             if history.len() > 10 {
@@ -2053,7 +2050,7 @@ impl OnboardingContract {
             .unwrap_or(Vec::new(&env));
         history.push_back(VerificationEntry {
             timestamp: env.ledger().timestamp(),
-            action: Symbol::new(&env, "requested"),
+            action: String::from_str(&env, "requested"),
             by: Some(user.clone()),
         });
         if history.len() > 10 {
@@ -2129,9 +2126,9 @@ impl OnboardingContract {
 
         // Append to history
         let action = if approve {
-            Symbol::new(&env, "approved")
+            String::from_str(&env, "approved")
         } else {
-            Symbol::new(&env, "rejected")
+            String::from_str(&env, "rejected")
         };
         let hist_key = DataKey::VerificationHistory(user.clone());
         let mut history: Vec<VerificationEntry> = env
@@ -2185,16 +2182,8 @@ impl OnboardingContract {
                 });
                 Self::extend_persistent(&env, &entry_key);
             }
-        let hist_key = DataKey::VerificationHistory(user.clone());
-        let history = env
-            .storage()
-            .persistent()
-            .get(&hist_key)
-            .unwrap_or(Vec::new(&env));
-        if env.storage().persistent().has(&hist_key) {
-            Self::extend_persistent(&env, &hist_key);
         }
-        history
+        result
     }
 
     /// Get all addresses currently awaiting manual verification (admin helper).
@@ -2405,7 +2394,7 @@ impl OnboardingContract {
             .unwrap_or(Vec::new(&env));
         history.push_back(VerificationEntry {
             timestamp: env.ledger().timestamp(),
-            action: Symbol::new(&env, "username_revoked"),
+            action: String::from_str(&env, "username_revoked"),
             by: Some(user.clone()),
         });
         if history.len() > 10 {
